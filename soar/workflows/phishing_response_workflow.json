@@ -1,0 +1,527 @@
+{
+  "id": "phishing-response-wf-001",
+  "name": "ThreatFlow Autonomous Phishing Response",
+  "description": "End-to-end autonomous phishing detection and response workflow. Ingests Wazuh alerts, enriches IOCs via VirusTotal and AbuseIPDB, risk-scores, creates TheHive cases, and auto-contains or routes to analyst based on risk level.",
+  "version": "1.0.0",
+  "tags": ["phishing", "autonomous-response", "SOC", "incident-response"],
+  "status": "production",
+  "created": "2026-01-01T00:00:00Z",
+  "updated": "2026-11-13T00:00:00Z",
+  "owner": "SOC-ThreatFlow",
+  "triggers": [
+    {
+      "id": "trigger-wazuh-webhook",
+      "name": "Wazuh Alert Webhook",
+      "type": "WEBHOOK",
+      "description": "Receives JSON alert payload from Wazuh via its active-response or integration framework",
+      "auth": {
+        "type": "HMAC_SHA256",
+        "header": "X-Wazuh-Signature",
+        "secret_env": "WAZUH_WEBHOOK_SECRET"
+      },
+      "schema": {
+        "type": "object",
+        "properties": {
+          "rule": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string" },
+              "level": { "type": "integer" },
+              "description": { "type": "string" },
+              "groups": { "type": "array", "items": { "type": "string" } },
+              "mitre": { "type": "object" }
+            }
+          },
+          "agent": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string" },
+              "name": { "type": "string" },
+              "ip": { "type": "string" }
+            }
+          },
+          "data": { "type": "object" },
+          "timestamp": { "type": "string" },
+          "id": { "type": "string" }
+        }
+      },
+      "position": { "x": 100, "y": 300 }
+    }
+  ],
+  "nodes": [
+    {
+      "id": "node-parse-iocs",
+      "name": "Parse IOCs from Alert",
+      "type": "PYTHON_SCRIPT",
+      "description": "Extracts Indicators of Compromise from the raw Wazuh alert payload",
+      "position": { "x": 350, "y": 300 },
+      "config": {
+        "runtime": "python3.11",
+        "timeout_seconds": 30,
+        "script": "import re\nimport json\n\ndef extract_iocs(alert):\n    iocs = {\n        'ips': [],\n        'domains': [],\n        'hashes': [],\n        'sender_email': None,\n        'recipient_email': None,\n        'subject': None,\n        'raw_alert': alert\n    }\n\n    # Flatten alert to searchable string\n    alert_str = json.dumps(alert)\n\n    # IPv4 extraction\n    ip_pattern = r'\\b(?:(?:25[0-5]|2[0-4]\\d|[01]?\\d\\d?)\\.){3}(?:25[0-5]|2[0-4]\\d|[01]?\\d\\d?)\\b'\n    raw_ips = re.findall(ip_pattern, alert_str)\n    # Filter out private/loopback\n    public_ips = [ip for ip in raw_ips if not ip.startswith(('10.', '192.168.', '172.', '127.', '0.'))]\n    iocs['ips'] = list(set(public_ips))\n\n    # Domain extraction\n    domain_pattern = r'\\b(?:[a-z0-9](?:[a-z0-9\\-]{0,61}[a-z0-9])?\\.)+(?:com|net|org|io|xyz|top|info|biz|ru|cn|tk|ml|ga|cf|gq)\\b'\n    iocs['domains'] = list(set(re.findall(domain_pattern, alert_str, re.IGNORECASE)))\n\n    # SHA256 hash\n    sha256_pattern = r'\\b[A-Fa-f0-9]{64}\\b'\n    iocs['hashes'] = list(set(re.findall(sha256_pattern, alert_str)))\n\n    # MD5 hash (fallback)\n    if not iocs['hashes']:\n        md5_pattern = r'\\b[A-Fa-f0-9]{32}\\b'\n        iocs['hashes'] = list(set(re.findall(md5_pattern, alert_str)))\n\n    # Email addresses\n    email_pattern = r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\\.[a-zA-Z0-9-.]+'\n    emails = re.findall(email_pattern, alert_str)\n    if emails:\n        iocs['sender_email'] = emails[0]\n        iocs['recipient_email'] = emails[1] if len(emails) > 1 else None\n\n    # Subject line from common Wazuh data fields\n    data = alert.get('data', {})\n    iocs['subject'] = data.get('subject') or data.get('win', {}).get('eventdata', {}).get('details', '')\n    iocs['alert_level'] = alert.get('rule', {}).get('level', 0)\n    iocs['rule_id'] = alert.get('rule', {}).get('id', 'unknown')\n    iocs['agent_name'] = alert.get('agent', {}).get('name', 'unknown')\n    iocs['agent_ip'] = alert.get('agent', {}).get('ip', 'unknown')\n    iocs['ioc_count'] = len(iocs['ips']) + len(iocs['domains']) + len(iocs['hashes'])\n\n    return iocs\n\nresult = extract_iocs(trigger_data)\noutput = json.dumps(result)"
+      },
+      "inputs": [
+        { "name": "trigger_data", "source_node": "trigger-wazuh-webhook", "source_field": "body" }
+      ],
+      "outputs": [
+        { "name": "iocs", "type": "object" }
+      ]
+    },
+    {
+      "id": "node-enrich-ip",
+      "name": "Enrich IP via AbuseIPDB",
+      "type": "HTTP_REQUEST",
+      "description": "Queries AbuseIPDB v2 API for each extracted public IP address",
+      "position": { "x": 600, "y": 150 },
+      "config": {
+        "method": "GET",
+        "url": "https://api.abuseipdb.com/api/v2/check",
+        "headers": {
+          "Key": "{{ env.ABUSEIPDB_API_KEY }}",
+          "Accept": "application/json"
+        },
+        "params": {
+          "ipAddress": "{{ node-parse-iocs.outputs.iocs.ips[0] }}",
+          "maxAgeInDays": "90",
+          "verbose": "true"
+        },
+        "timeout_seconds": 15,
+        "retry": {
+          "max_attempts": 3,
+          "backoff_seconds": 2,
+          "retry_on_status": [429, 500, 502, 503]
+        }
+      },
+      "inputs": [
+        { "name": "ip_list", "source_node": "node-parse-iocs", "source_field": "iocs.ips" }
+      ],
+      "outputs": [
+        { "name": "abuseipdb_response", "type": "object" }
+      ],
+      "condition": "{{ node-parse-iocs.outputs.iocs.ips | length > 0 }}"
+    },
+    {
+      "id": "node-enrich-hash",
+      "name": "Enrich File Hash via VirusTotal",
+      "type": "HTTP_REQUEST",
+      "description": "Looks up file hash in VirusTotal v3 API",
+      "position": { "x": 600, "y": 300 },
+      "config": {
+        "method": "GET",
+        "url": "https://www.virustotal.com/api/v3/files/{{ node-parse-iocs.outputs.iocs.hashes[0] }}",
+        "headers": {
+          "x-apikey": "{{ env.VIRUSTOTAL_API_KEY }}",
+          "Accept": "application/json"
+        },
+        "timeout_seconds": 20,
+        "retry": {
+          "max_attempts": 3,
+          "backoff_seconds": 15,
+          "retry_on_status": [429, 500, 502, 503]
+        }
+      },
+      "inputs": [
+        { "name": "hash_list", "source_node": "node-parse-iocs", "source_field": "iocs.hashes" }
+      ],
+      "outputs": [
+        { "name": "vt_hash_response", "type": "object" }
+      ],
+      "condition": "{{ node-parse-iocs.outputs.iocs.hashes | length > 0 }}"
+    },
+    {
+      "id": "node-enrich-domain",
+      "name": "Enrich Domain via VirusTotal",
+      "type": "HTTP_REQUEST",
+      "description": "Looks up domain reputation in VirusTotal v3 API",
+      "position": { "x": 600, "y": 450 },
+      "config": {
+        "method": "GET",
+        "url": "https://www.virustotal.com/api/v3/domains/{{ node-parse-iocs.outputs.iocs.domains[0] }}",
+        "headers": {
+          "x-apikey": "{{ env.VIRUSTOTAL_API_KEY }}",
+          "Accept": "application/json"
+        },
+        "timeout_seconds": 20,
+        "retry": {
+          "max_attempts": 3,
+          "backoff_seconds": 15,
+          "retry_on_status": [429, 500, 502, 503]
+        }
+      },
+      "inputs": [
+        { "name": "domain_list", "source_node": "node-parse-iocs", "source_field": "iocs.domains" }
+      ],
+      "outputs": [
+        { "name": "vt_domain_response", "type": "object" }
+      ],
+      "condition": "{{ node-parse-iocs.outputs.iocs.domains | length > 0 }}"
+    },
+    {
+      "id": "node-risk-score",
+      "name": "Calculate Composite Risk Score",
+      "type": "PYTHON_SCRIPT",
+      "description": "Runs the RiskScoringEngine to produce a composite 0-100 risk score with CRITICAL/HIGH/MEDIUM/LOW classification",
+      "position": { "x": 900, "y": 300 },
+      "config": {
+        "runtime": "python3.11",
+        "timeout_seconds": 30,
+        "script": "import json\n\n# --- Lightweight inline scorer (mirrors risk_scoring_engine.py logic) ---\nWEIGHTS = {\n    'vt_score': 0.35,\n    'abuseipdb_score': 0.25,\n    'alert_level': 0.20,\n    'ioc_quantity': 0.10,\n    'historical': 0.10\n}\n\ndef normalize_alert_level(level):\n    # Wazuh levels 0-15 → 0-100\n    return min(int(level) * (100 / 15), 100)\n\ndef normalize_ioc_count(count):\n    # 0 iocs=0, 5+ iocs=100\n    return min(int(count) * 20, 100)\n\niocs = json.loads('{{ node-parse-iocs.outputs.iocs | tojson }}')\nvt_hash = json.loads('{{ node-enrich-hash.outputs.vt_hash_response | default(\"{}\") | tojson }}')\nvt_domain = json.loads('{{ node-enrich-domain.outputs.vt_domain_response | default(\"{}\") | tojson }}')\nabuseipdb = json.loads('{{ node-enrich-ip.outputs.abuseipdb_response | default(\"{}\") | tojson }}')\n\n# Extract scores from enrichment results\nvt_malicious = 0\nvt_total_engines = 0\nif vt_hash.get('data'):\n    stats = vt_hash['data'].get('attributes', {}).get('last_analysis_stats', {})\n    vt_malicious = stats.get('malicious', 0)\n    vt_total_engines = sum(stats.values()) if stats else 1\n\nif vt_domain.get('data') and vt_malicious == 0:\n    stats = vt_domain['data'].get('attributes', {}).get('last_analysis_stats', {})\n    vt_malicious = stats.get('malicious', 0)\n    vt_total_engines = sum(stats.values()) if stats else 1\n\nvt_score = (vt_malicious / max(vt_total_engines, 1)) * 100\nabuseipdb_score = abuseipdb.get('data', {}).get('abuseConfidenceScore', 0)\nalert_level_normalized = normalize_alert_level(iocs.get('alert_level', 0))\nioc_count_normalized = normalize_ioc_count(iocs.get('ioc_count', 0))\n\ncomposite = (\n    vt_score * WEIGHTS['vt_score'] +\n    abuseipdb_score * WEIGHTS['abuseipdb_score'] +\n    alert_level_normalized * WEIGHTS['alert_level'] +\n    ioc_count_normalized * WEIGHTS['ioc_quantity'] +\n    0 * WEIGHTS['historical']  # historical context = 0 without DB lookup\n)\n\nif composite >= 80:\n    risk_level = 'CRITICAL'\n    action = 'AUTO_CONTAIN'\nelif composite >= 60:\n    risk_level = 'HIGH'\n    action = 'ANALYST_APPROVE'\nelif composite >= 40:\n    risk_level = 'MEDIUM'\n    action = 'MONITOR'\nelse:\n    risk_level = 'LOW'\n    action = 'LOG_ONLY'\n\nresult = {\n    'total_score': round(composite, 2),\n    'risk_level': risk_level,\n    'recommended_action': action,\n    'contributing_factors': [\n        {'factor': 'VirusTotal Detection Rate', 'weight': 0.35, 'raw_value': round(vt_score, 2), 'weighted': round(vt_score * 0.35, 2)},\n        {'factor': 'AbuseIPDB Confidence', 'weight': 0.25, 'raw_value': abuseipdb_score, 'weighted': round(abuseipdb_score * 0.25, 2)},\n        {'factor': 'Wazuh Alert Level', 'weight': 0.20, 'raw_value': round(alert_level_normalized, 2), 'weighted': round(alert_level_normalized * 0.20, 2)},\n        {'factor': 'IOC Quantity', 'weight': 0.10, 'raw_value': ioc_count_normalized, 'weighted': round(ioc_count_normalized * 0.10, 2)},\n        {'factor': 'Historical Context', 'weight': 0.10, 'raw_value': 0, 'weighted': 0.0}\n    ],\n    'confidence': 0.85 if vt_total_engines > 20 else 0.60\n}\n\noutput = json.dumps(result)"
+      },
+      "inputs": [
+        { "name": "iocs", "source_node": "node-parse-iocs", "source_field": "iocs" },
+        { "name": "vt_hash_response", "source_node": "node-enrich-hash", "source_field": "vt_hash_response" },
+        { "name": "vt_domain_response", "source_node": "node-enrich-domain", "source_field": "vt_domain_response" },
+        { "name": "abuseipdb_response", "source_node": "node-enrich-ip", "source_field": "abuseipdb_response" }
+      ],
+      "outputs": [
+        { "name": "risk_assessment", "type": "object" }
+      ]
+    },
+    {
+      "id": "node-create-case",
+      "name": "Create TheHive Case",
+      "type": "HTTP_REQUEST",
+      "description": "Creates a new case in TheHive 5.x for tracking the phishing incident",
+      "position": { "x": 1150, "y": 300 },
+      "config": {
+        "method": "POST",
+        "url": "{{ env.THEHIVE_URL }}/api/v1/case",
+        "headers": {
+          "Authorization": "Bearer {{ env.THEHIVE_API_KEY }}",
+          "Content-Type": "application/json",
+          "Accept": "application/json"
+        },
+        "body": {
+          "title": "Phishing Incident - {{ node-parse-iocs.outputs.iocs.agent_name }} - Rule {{ node-parse-iocs.outputs.iocs.rule_id }}",
+          "description": "**Automated Phishing Case**\\n\\nAlert Level: {{ node-parse-iocs.outputs.iocs.alert_level }}\\nRisk Score: {{ node-risk-score.outputs.risk_assessment.total_score }}\\nRisk Level: {{ node-risk-score.outputs.risk_assessment.risk_level }}\\n\\n**IOCs Identified:**\\n- IPs: {{ node-parse-iocs.outputs.iocs.ips | join(', ') }}\\n- Domains: {{ node-parse-iocs.outputs.iocs.domains | join(', ') }}\\n- Hashes: {{ node-parse-iocs.outputs.iocs.hashes | join(', ') }}\\n- Sender: {{ node-parse-iocs.outputs.iocs.sender_email }}\\n\\n**Recommended Action:** {{ node-risk-score.outputs.risk_assessment.recommended_action }}",
+          "severity": "{{ 3 if node-risk-score.outputs.risk_assessment.risk_level == 'CRITICAL' else (2 if node-risk-score.outputs.risk_assessment.risk_level == 'HIGH' else 1) }}",
+          "tlp": 2,
+          "pap": 2,
+          "tags": ["phishing", "automated", "wazuh", "{{ node-risk-score.outputs.risk_assessment.risk_level | lower }}"],
+          "flag": "{{ true if node-risk-score.outputs.risk_assessment.risk_level in ['CRITICAL','HIGH'] else false }}",
+          "assignee": "soc-tier1",
+          "customFields": {
+            "risk_score": { "integer": "{{ node-risk-score.outputs.risk_assessment.total_score }}" },
+            "source_agent": { "string": "{{ node-parse-iocs.outputs.iocs.agent_name }}" },
+            "automated_action": { "string": "{{ node-risk-score.outputs.risk_assessment.recommended_action }}" }
+          }
+        },
+        "timeout_seconds": 30
+      },
+      "inputs": [
+        { "name": "risk_assessment", "source_node": "node-risk-score", "source_field": "risk_assessment" },
+        { "name": "iocs", "source_node": "node-parse-iocs", "source_field": "iocs" }
+      ],
+      "outputs": [
+        { "name": "case_id", "type": "string", "extract_path": "body._id" },
+        { "name": "case_number", "type": "integer", "extract_path": "body.number" }
+      ]
+    },
+    {
+      "id": "node-add-observables",
+      "name": "Add Observables to TheHive Case",
+      "type": "HTTP_REQUEST",
+      "description": "Adds all extracted IOCs as observables to the TheHive case",
+      "position": { "x": 1150, "y": 450 },
+      "config": {
+        "method": "POST",
+        "url": "{{ env.THEHIVE_URL }}/api/v1/case/{{ node-create-case.outputs.case_id }}/observable",
+        "headers": {
+          "Authorization": "Bearer {{ env.THEHIVE_API_KEY }}",
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "dataType": "ip",
+          "data": "{{ node-parse-iocs.outputs.iocs.ips | join('\\n') }}",
+          "tlp": 2,
+          "ioc": true,
+          "tags": ["phishing", "automated-enrichment"],
+          "message": "Extracted from Wazuh alert by ThreatFlow automation"
+        },
+        "timeout_seconds": 15
+      },
+      "inputs": [
+        { "name": "case_id", "source_node": "node-create-case", "source_field": "case_id" }
+      ],
+      "outputs": [
+        { "name": "observable_ids", "type": "array" }
+      ]
+    },
+    {
+      "id": "node-notify-soc",
+      "name": "Notify SOC Team",
+      "type": "HTTP_REQUEST",
+      "description": "Sends enriched alert notification to the SOC via Microsoft Teams or Slack webhook",
+      "position": { "x": 1400, "y": 150 },
+      "config": {
+        "method": "POST",
+        "url": "{{ env.SOC_WEBHOOK_URL }}",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "@type": "MessageCard",
+          "@context": "http://schema.org/extensions",
+          "themeColor": "{{ 'FF0000' if node-risk-score.outputs.risk_assessment.risk_level == 'CRITICAL' else ('FFA500' if node-risk-score.outputs.risk_assessment.risk_level == 'HIGH' else '0076D7') }}",
+          "summary": "🚨 ThreatFlow Phishing Alert",
+          "sections": [
+            {
+              "activityTitle": "🛡️ ThreatFlow Autonomous Phishing Response",
+              "activitySubtitle": "Risk Level: {{ node-risk-score.outputs.risk_assessment.risk_level }} | Score: {{ node-risk-score.outputs.risk_assessment.total_score }}/100",
+              "facts": [
+                { "name": "Agent", "value": "{{ node-parse-iocs.outputs.iocs.agent_name }}" },
+                { "name": "Rule ID", "value": "{{ node-parse-iocs.outputs.iocs.rule_id }}" },
+                { "name": "Risk Score", "value": "{{ node-risk-score.outputs.risk_assessment.total_score }}/100 ({{ node-risk-score.outputs.risk_assessment.risk_level }})" },
+                { "name": "Action Taken", "value": "{{ node-risk-score.outputs.risk_assessment.recommended_action }}" },
+                { "name": "TheHive Case", "value": "#{{ node-create-case.outputs.case_number }}" },
+                { "name": "IOCs", "value": "IPs: {{ node-parse-iocs.outputs.iocs.ips | length }} | Domains: {{ node-parse-iocs.outputs.iocs.domains | length }} | Hashes: {{ node-parse-iocs.outputs.iocs.hashes | length }}" }
+              ]
+            }
+          ],
+          "potentialAction": [
+            {
+              "@type": "OpenUri",
+              "name": "Open TheHive Case",
+              "targets": [{ "os": "default", "uri": "{{ env.THEHIVE_URL }}/cases/{{ node-create-case.outputs.case_id }}" }]
+            }
+          ]
+        },
+        "timeout_seconds": 10
+      },
+      "inputs": [
+        { "name": "risk_assessment", "source_node": "node-risk-score", "source_field": "risk_assessment" },
+        { "name": "case_id", "source_node": "node-create-case", "source_field": "case_id" }
+      ],
+      "outputs": [
+        { "name": "notification_status", "type": "integer" }
+      ]
+    },
+    {
+      "id": "node-decision",
+      "name": "Risk-Based Decision Router",
+      "type": "CONDITION",
+      "description": "Routes workflow based on composite risk score: >70 auto-contain, 40-70 analyst review, <40 close",
+      "position": { "x": 1400, "y": 300 },
+      "config": {
+        "type": "MULTI_BRANCH",
+        "branches": [
+          {
+            "id": "branch-critical-high",
+            "name": "AUTO_CONTAIN",
+            "condition": "{{ node-risk-score.outputs.risk_assessment.total_score > 70 }}",
+            "next_node": "node-contain-high"
+          },
+          {
+            "id": "branch-medium",
+            "name": "ANALYST_REVIEW",
+            "condition": "{{ node-risk-score.outputs.risk_assessment.total_score >= 40 and node-risk-score.outputs.risk_assessment.total_score <= 70 }}",
+            "next_node": "node-analyst-review"
+          },
+          {
+            "id": "branch-low",
+            "name": "CLOSE_LOW_RISK",
+            "condition": "{{ node-risk-score.outputs.risk_assessment.total_score < 40 }}",
+            "next_node": "node-close-low"
+          }
+        ]
+      },
+      "inputs": [
+        { "name": "risk_assessment", "source_node": "node-risk-score", "source_field": "risk_assessment" }
+      ]
+    },
+    {
+      "id": "node-contain-high",
+      "name": "Auto-Contain: Block & Isolate",
+      "type": "PYTHON_SCRIPT",
+      "description": "Automatically blocks malicious IPs via firewall API and disables compromised user via Active Directory",
+      "position": { "x": 1650, "y": 150 },
+      "config": {
+        "runtime": "python3.11",
+        "timeout_seconds": 60,
+        "script": "import json\nimport requests\nimport os\n\niocs = json.loads('{{ node-parse-iocs.outputs.iocs | tojson }}')\ncase_id = '{{ node-create-case.outputs.case_id }}'\nresults = {'blocked_ips': [], 'disabled_users': [], 'errors': []}\n\nFW_URL = os.environ.get('FIREWALL_API_URL', 'http://firewall-mgmt:8080')\nFW_KEY = os.environ.get('FIREWALL_API_KEY', '')\nAD_URL = os.environ.get('AD_API_URL', 'http://ad-proxy:8081')\nAD_KEY = os.environ.get('AD_API_KEY', '')\n\n# Block IPs on perimeter firewall\nfor ip in iocs.get('ips', []):\n    try:\n        resp = requests.post(\n            f'{FW_URL}/api/v1/block/ip',\n            json={'ip': ip, 'reason': f'ThreatFlow auto-block: Case {case_id}', 'duration_hours': 24},\n            headers={'Authorization': f'Bearer {FW_KEY}'},\n            timeout=10\n        )\n        if resp.status_code in [200, 201]:\n            results['blocked_ips'].append(ip)\n        else:\n            results['errors'].append(f'FW block failed for {ip}: HTTP {resp.status_code}')\n    except Exception as e:\n        results['errors'].append(f'FW block exception for {ip}: {str(e)}')\n\n# Disable compromised user in Active Directory\nagent_user = iocs.get('agent_name', '').replace('WORKSTATION-', '').lower()\nif agent_user:\n    try:\n        resp = requests.post(\n            f'{AD_URL}/api/v1/users/disable',\n            json={'username': agent_user, 'reason': f'ThreatFlow: Phishing compromise, Case {case_id}'},\n            headers={'Authorization': f'Bearer {AD_KEY}'},\n            timeout=10\n        )\n        if resp.status_code in [200, 204]:\n            results['disabled_users'].append(agent_user)\n        else:\n            results['errors'].append(f'AD disable failed for {agent_user}: HTTP {resp.status_code}')\n    except Exception as e:\n        results['errors'].append(f'AD disable exception for {agent_user}: {str(e)}')\n\nresults['action'] = 'CONTAINED'\nresults['containment_case'] = case_id\noutput = json.dumps(results)"
+      },
+      "inputs": [
+        { "name": "iocs", "source_node": "node-parse-iocs", "source_field": "iocs" },
+        { "name": "case_id", "source_node": "node-create-case", "source_field": "case_id" }
+      ],
+      "outputs": [
+        { "name": "containment_result", "type": "object" }
+      ]
+    },
+    {
+      "id": "node-analyst-review",
+      "name": "Analyst Review: Await Human Decision",
+      "type": "WAIT_FOR_WEBHOOK",
+      "description": "Creates a TheHive review task and pauses workflow until analyst approves or rejects",
+      "position": { "x": 1650, "y": 300 },
+      "config": {
+        "setup": {
+          "method": "POST",
+          "url": "{{ env.THEHIVE_URL }}/api/v1/case/{{ node-create-case.outputs.case_id }}/task",
+          "headers": {
+            "Authorization": "Bearer {{ env.THEHIVE_API_KEY }}",
+            "Content-Type": "application/json"
+          },
+          "body": {
+            "title": "🔍 ANALYST REVIEW REQUIRED - Phishing Case",
+            "description": "**Risk Score: {{ node-risk-score.outputs.risk_assessment.total_score }}/100 ({{ node-risk-score.outputs.risk_assessment.risk_level }})**\\n\\nPlease review the enrichment data and decide:\\n1. APPROVE → Trigger containment (block IP, disable user)\\n2. REJECT → Close as false positive\\n\\nComplete this task to unblock workflow automation.",
+            "status": "Waiting",
+            "assignee": "soc-tier2",
+            "flag": true
+          }
+        },
+        "resume_webhook": {
+          "path": "/webhooks/analyst-decision/{{ node-create-case.outputs.case_id }}",
+          "timeout_seconds": 3600,
+          "timeout_action": "ESCALATE_TO_TIER2"
+        }
+      },
+      "inputs": [
+        { "name": "case_id", "source_node": "node-create-case", "source_field": "case_id" },
+        { "name": "risk_assessment", "source_node": "node-risk-score", "source_field": "risk_assessment" }
+      ],
+      "outputs": [
+        { "name": "analyst_decision", "type": "string" },
+        { "name": "analyst_notes", "type": "string" }
+      ]
+    },
+    {
+      "id": "node-evidence-collect",
+      "name": "Collect Forensic Evidence",
+      "type": "HTTP_REQUEST",
+      "description": "Triggers Wazuh active response to run forensic collection on the affected endpoint",
+      "position": { "x": 1900, "y": 225 },
+      "config": {
+        "method": "PUT",
+        "url": "{{ env.WAZUH_API_URL }}/active-response",
+        "headers": {
+          "Authorization": "Bearer {{ env.WAZUH_JWT_TOKEN }}",
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "command": "forensic-collect",
+          "custom": true,
+          "arguments": [
+            "case_id={{ node-create-case.outputs.case_id }}",
+            "output_path=/var/ossec/forensics/{{ node-create-case.outputs.case_id }}"
+          ],
+          "agents_list": ["{{ node-parse-iocs.outputs.iocs.agent_id }}"]
+        },
+        "timeout_seconds": 30
+      },
+      "inputs": [
+        { "name": "case_id", "source_node": "node-create-case", "source_field": "case_id" },
+        { "name": "containment_result", "source_node": "node-contain-high", "source_field": "containment_result" }
+      ],
+      "outputs": [
+        { "name": "forensic_job_id", "type": "string" }
+      ]
+    },
+    {
+      "id": "node-close-low",
+      "name": "Close Low-Risk Case",
+      "type": "HTTP_REQUEST",
+      "description": "Closes the TheHive case as low risk / informational",
+      "position": { "x": 1650, "y": 450 },
+      "config": {
+        "method": "PATCH",
+        "url": "{{ env.THEHIVE_URL }}/api/v1/case/{{ node-create-case.outputs.case_id }}",
+        "headers": {
+          "Authorization": "Bearer {{ env.THEHIVE_API_KEY }}",
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "Resolved",
+          "summary": "Automated ThreatFlow closure: Risk score {{ node-risk-score.outputs.risk_assessment.total_score }}/100 below threshold (40). No action required. Logged for statistical tracking.",
+          "impactStatus": "NotApplicable",
+          "resolutionStatus": "FalsePositive"
+        },
+        "timeout_seconds": 15
+      },
+      "inputs": [
+        { "name": "case_id", "source_node": "node-create-case", "source_field": "case_id" }
+      ],
+      "outputs": [
+        { "name": "close_status", "type": "integer" }
+      ]
+    },
+    {
+      "id": "node-close-final",
+      "name": "Close Case with Outcome",
+      "type": "HTTP_REQUEST",
+      "description": "Updates TheHive case with final containment and forensic results, then closes",
+      "position": { "x": 2150, "y": 225 },
+      "config": {
+        "method": "PATCH",
+        "url": "{{ env.THEHIVE_URL }}/api/v1/case/{{ node-create-case.outputs.case_id }}",
+        "headers": {
+          "Authorization": "Bearer {{ env.THEHIVE_API_KEY }}",
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "Resolved",
+          "summary": "ThreatFlow auto-response complete. Containment: {{ node-contain-high.outputs.containment_result | tojson }}. Forensics job: {{ node-evidence-collect.outputs.forensic_job_id }}. Risk score was {{ node-risk-score.outputs.risk_assessment.total_score }}/100.",
+          "impactStatus": "WithImpact",
+          "resolutionStatus": "TruePositive"
+        },
+        "timeout_seconds": 15
+      },
+      "inputs": [
+        { "name": "case_id", "source_node": "node-create-case", "source_field": "case_id" },
+        { "name": "containment_result", "source_node": "node-contain-high", "source_field": "containment_result" },
+        { "name": "forensic_job_id", "source_node": "node-evidence-collect", "source_field": "forensic_job_id" }
+      ],
+      "outputs": [
+        { "name": "final_status", "type": "integer" }
+      ]
+    }
+  ],
+  "connections": [
+    { "id": "conn-01", "from": "trigger-wazuh-webhook", "to": "node-parse-iocs", "label": "raw_alert" },
+    { "id": "conn-02", "from": "node-parse-iocs", "to": "node-enrich-ip", "label": "ips", "condition": "has_ips" },
+    { "id": "conn-03", "from": "node-parse-iocs", "to": "node-enrich-hash", "label": "hashes", "condition": "has_hashes" },
+    { "id": "conn-04", "from": "node-parse-iocs", "to": "node-enrich-domain", "label": "domains", "condition": "has_domains" },
+    { "id": "conn-05", "from": "node-enrich-ip", "to": "node-risk-score", "label": "abuseipdb_result" },
+    { "id": "conn-06", "from": "node-enrich-hash", "to": "node-risk-score", "label": "vt_hash_result" },
+    { "id": "conn-07", "from": "node-enrich-domain", "to": "node-risk-score", "label": "vt_domain_result" },
+    { "id": "conn-08", "from": "node-risk-score", "to": "node-create-case", "label": "risk_assessment" },
+    { "id": "conn-09", "from": "node-create-case", "to": "node-add-observables", "label": "case_created" },
+    { "id": "conn-10", "from": "node-create-case", "to": "node-notify-soc", "label": "case_id" },
+    { "id": "conn-11", "from": "node-create-case", "to": "node-decision", "label": "case_ready" },
+    { "id": "conn-12", "from": "node-decision", "to": "node-contain-high", "label": "score > 70", "branch": "AUTO_CONTAIN" },
+    { "id": "conn-13", "from": "node-decision", "to": "node-analyst-review", "label": "40 ≤ score ≤ 70", "branch": "ANALYST_REVIEW" },
+    { "id": "conn-14", "from": "node-decision", "to": "node-close-low", "label": "score < 40", "branch": "CLOSE_LOW_RISK" },
+    { "id": "conn-15", "from": "node-contain-high", "to": "node-evidence-collect", "label": "contained" },
+    { "id": "conn-16", "from": "node-analyst-review", "to": "node-contain-high", "label": "APPROVED", "condition": "analyst_decision == 'APPROVE'" },
+    { "id": "conn-17", "from": "node-analyst-review", "to": "node-close-low", "label": "REJECTED", "condition": "analyst_decision == 'REJECT'" },
+    { "id": "conn-18", "from": "node-evidence-collect", "to": "node-close-final", "label": "forensics_queued" }
+  ],
+  "environment_variables": {
+    "WAZUH_WEBHOOK_SECRET": { "description": "HMAC secret for validating Wazuh webhook payloads", "required": true, "type": "SECRET" },
+    "WAZUH_API_URL": { "description": "Wazuh Manager API URL e.g. https://wazuh-manager:55000", "required": true, "type": "STRING" },
+    "WAZUH_JWT_TOKEN": { "description": "Wazuh API JWT token", "required": true, "type": "SECRET" },
+    "VIRUSTOTAL_API_KEY": { "description": "VirusTotal v3 API key", "required": true, "type": "SECRET" },
+    "ABUSEIPDB_API_KEY": { "description": "AbuseIPDB v2 API key", "required": true, "type": "SECRET" },
+    "THEHIVE_URL": { "description": "TheHive 5.x base URL e.g. http://thehive:9000", "required": true, "type": "STRING" },
+    "THEHIVE_API_KEY": { "description": "TheHive API key with case write permissions", "required": true, "type": "SECRET" },
+    "SOC_WEBHOOK_URL": { "description": "Microsoft Teams or Slack incoming webhook URL", "required": true, "type": "SECRET" },
+    "FIREWALL_API_URL": { "description": "Perimeter firewall management API URL", "required": false, "type": "STRING" },
+    "FIREWALL_API_KEY": { "description": "Firewall API authentication key", "required": false, "type": "SECRET" },
+    "AD_API_URL": { "description": "Active Directory proxy API URL", "required": false, "type": "STRING" },
+    "AD_API_KEY": { "description": "Active Directory API authentication key", "required": false, "type": "SECRET" }
+  },
+  "metadata": {
+    "mitre_techniques": [
+      "T1566 - Phishing",
+      "T1566.001 - Spearphishing Attachment",
+      "T1566.002 - Spearphishing Link",
+      "T1204 - User Execution",
+      "T1059 - Command and Scripting Interpreter",
+      "T1003 - OS Credential Dumping"
+    ],
+    "avg_execution_time_seconds": 45,
+    "sla_target_seconds": 120,
+    "false_positive_rate_target": "< 5%",
+    "data_retention_days": 90
+  }
+}

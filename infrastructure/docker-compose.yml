@@ -1,0 +1,532 @@
+version: "3.8"
+
+# =============================================================================
+# ThreatFlow Enterprise SOAR - Docker Compose
+# Stack: Wazuh SIEM/EDR + Shuffle SOAR + TheHive Case Management
+# =============================================================================
+
+networks:
+  soc-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+  management-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/24
+
+volumes:
+  wazuh-manager-data:
+  wazuh-manager-logs:
+  wazuh-manager-etc:
+  wazuh-manager-queue:
+  wazuh-manager-var-multigroups:
+  wazuh-manager-active-response:
+  wazuh-manager-agentless:
+  wazuh-manager-wazuh-lib:
+  wazuh-manager-wodles:
+  wazuh-indexer-data:
+  wazuh-dashboard-config:
+  cassandra-data:
+  elasticsearch-thehive-data:
+  thehive-data:
+  minio-data:
+  cortex-data:
+  shuffle-data:
+  shuffle-db:
+
+services:
+
+  # ===========================================================================
+  # WAZUH INDEXER (OpenSearch)
+  # ===========================================================================
+  wazuh-indexer:
+    image: wazuh/wazuh-indexer:4.7.5
+    container_name: wazuh-indexer
+    hostname: wazuh-indexer
+    restart: unless-stopped
+    networks:
+      - soc-network
+      - management-network
+    ports:
+      - "9200:9200"
+    environment:
+      - "OPENSEARCH_JAVA_OPTS=-Xms${WAZUH_INDEXER_HEAP_MIN:-1g} -Xmx${WAZUH_INDEXER_HEAP_MAX:-1g}"
+      - "bootstrap.memory_lock=true"
+      - "INDEXER_USERNAME=${WAZUH_INDEXER_USERNAME:-admin}"
+      - "INDEXER_PASSWORD=${WAZUH_INDEXER_PASSWORD}"
+      - "WAZUH_MANAGER_API_HOST=wazuh-manager"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - wazuh-indexer-data:/var/lib/wazuh-indexer
+      - ./certs/indexer.pem:/usr/share/wazuh-indexer/certs/indexer.pem:ro
+      - ./certs/indexer-key.pem:/usr/share/wazuh-indexer/certs/indexer-key.pem:ro
+      - ./certs/root-ca.pem:/usr/share/wazuh-indexer/certs/root-ca.pem:ro
+      - ./config/wazuh_indexer/opensearch.yml:/usr/share/wazuh-indexer/opensearch.yml:ro
+      - ./config/wazuh_indexer/internal_users.yml:/usr/share/wazuh-indexer/opensearch-security/internal_users.yml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sSku ${WAZUH_INDEXER_USERNAME:-admin}:${WAZUH_INDEXER_PASSWORD} https://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 30s
+      timeout: 15s
+      retries: 10
+      start_period: 90s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 1G
+
+  # ===========================================================================
+  # WAZUH MANAGER
+  # ===========================================================================
+  wazuh-manager:
+    image: wazuh/wazuh-manager:4.7.5
+    container_name: wazuh-manager
+    hostname: wazuh-manager
+    restart: unless-stopped
+    depends_on:
+      wazuh-indexer:
+        condition: service_healthy
+    networks:
+      - soc-network
+      - management-network
+    ports:
+      - "1514:1514/udp"   # Agent communication (syslog/UDP)
+      - "1515:1515"        # Agent registration
+      - "55000:55000"      # Wazuh API (REST)
+    environment:
+      - INDEXER_URL=https://wazuh-indexer:9200
+      - INDEXER_USERNAME=${WAZUH_INDEXER_USERNAME:-admin}
+      - INDEXER_PASSWORD=${WAZUH_INDEXER_PASSWORD}
+      - FILEBEAT_SSL_VERIFICATION_MODE=full
+      - SSL_CERTIFICATE_AUTHORITIES=/etc/ssl/root-ca.pem
+      - SSL_CERTIFICATE=/etc/ssl/filebeat.pem
+      - SSL_KEY=/etc/ssl/filebeat-key.pem
+      - API_USERNAME=${WAZUH_API_USERNAME:-wazuh-wui}
+      - API_PASSWORD=${WAZUH_API_PASSWORD}
+    volumes:
+      - wazuh-manager-data:/var/ossec/data
+      - wazuh-manager-logs:/var/ossec/logs
+      - wazuh-manager-etc:/var/ossec/etc
+      - wazuh-manager-queue:/var/ossec/queue
+      - wazuh-manager-var-multigroups:/var/ossec/var/multigroups
+      - wazuh-manager-active-response:/var/ossec/active-response
+      - wazuh-manager-agentless:/var/ossec/agentless
+      - wazuh-manager-wazuh-lib:/var/ossec/wazuh-lib
+      - wazuh-manager-wodles:/var/ossec/wodles
+      - ./certs/root-ca-manager.pem:/etc/ssl/root-ca.pem:ro
+      - ./certs/wazuh-manager.pem:/etc/ssl/filebeat.pem:ro
+      - ./certs/wazuh-manager-key.pem:/etc/ssl/filebeat-key.pem:ro
+      - ./config/wazuh_manager/ossec.conf:/wazuh-config-mount/etc/ossec.conf:ro
+      - ../detection/wazuh_rules:/var/ossec/etc/rules/custom:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sku ${WAZUH_API_USERNAME:-wazuh-wui}:${WAZUH_API_PASSWORD} https://localhost:55000/ | grep -q 'title'"]
+      interval: 30s
+      timeout: 15s
+      retries: 10
+      start_period: 120s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+
+  # ===========================================================================
+  # WAZUH DASHBOARD (Kibana-based)
+  # ===========================================================================
+  wazuh-dashboard:
+    image: wazuh/wazuh-dashboard:4.7.5
+    container_name: wazuh-dashboard
+    hostname: wazuh-dashboard
+    restart: unless-stopped
+    depends_on:
+      wazuh-indexer:
+        condition: service_healthy
+      wazuh-manager:
+        condition: service_healthy
+    networks:
+      - soc-network
+      - management-network
+    ports:
+      - "443:5601"
+    environment:
+      - INDEXER_USERNAME=${WAZUH_INDEXER_USERNAME:-admin}
+      - INDEXER_PASSWORD=${WAZUH_INDEXER_PASSWORD}
+      - WAZUH_API_URL=https://wazuh-manager
+      - DASHBOARD_USERNAME=${WAZUH_DASHBOARD_USERNAME:-kibanaserver}
+      - DASHBOARD_PASSWORD=${WAZUH_DASHBOARD_PASSWORD}
+      - API_USERNAME=${WAZUH_API_USERNAME:-wazuh-wui}
+      - API_PASSWORD=${WAZUH_API_PASSWORD}
+    volumes:
+      - wazuh-dashboard-config:/usr/share/wazuh-dashboard/data
+      - ./certs/wazuh-dashboard.pem:/usr/share/wazuh-dashboard/certs/wazuh-dashboard.pem:ro
+      - ./certs/wazuh-dashboard-key.pem:/usr/share/wazuh-dashboard/certs/wazuh-dashboard-key.pem:ro
+      - ./certs/root-ca.pem:/usr/share/wazuh-dashboard/certs/root-ca.pem:ro
+      - ./config/wazuh_dashboard/opensearch_dashboards.yml:/usr/share/wazuh-dashboard/config/opensearch_dashboards.yml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sk https://localhost:5601/app/wazuh | grep -q 'wazuh'"]
+      interval: 30s
+      timeout: 15s
+      retries: 10
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  # ===========================================================================
+  # SHUFFLE SOAR BACKEND
+  # ===========================================================================
+  shuffle-backend:
+    image: ghcr.io/shuffle/shuffle:latest
+    container_name: shuffle-backend
+    hostname: shuffle-backend
+    restart: unless-stopped
+    networks:
+      - soc-network
+      - management-network
+    ports:
+      - "3001:3001"
+    environment:
+      - DATASTORE_EMULATOR_HOST=shuffle-db:8000
+      - SHUFFLE_APP_HOTLOAD_FOLDER=/shuffle-apps
+      - SHUFFLE_FILE_LOCATION=/shuffle-files
+      - SHUFFLE_ENCRYPTION_MODIFIER=${SHUFFLE_ENCRYPTION_KEY}
+      - SHUFFLE_LOGS_DISABLED=false
+      - BACKEND_HOSTNAME=shuffle-backend
+      - BACKEND_PORT=5001
+      - FRONTEND_PORT=3000
+      - SHUFFLE_DEFAULT_USERNAME=${SHUFFLE_ADMIN_USERNAME:-admin}
+      - SHUFFLE_DEFAULT_PASSWORD=${SHUFFLE_ADMIN_PASSWORD}
+      - SHUFFLE_DEFAULT_APIKEY=${SHUFFLE_ADMIN_APIKEY}
+      - ORG_ID=${SHUFFLE_ORG_ID:-ThreatFlow}
+      - SHUFFLE_BASE_URL=http://shuffle-backend:3001
+      - THEHIVE_URL=http://thehive:9000
+      - THEHIVE_API_KEY=${THEHIVE_API_KEY}
+      - WAZUH_API_URL=https://wazuh-manager:55000
+      - WAZUH_API_USERNAME=${WAZUH_API_USERNAME:-wazuh-wui}
+      - WAZUH_API_PASSWORD=${WAZUH_API_PASSWORD}
+      - VIRUSTOTAL_API_KEY=${VIRUSTOTAL_API_KEY}
+      - ABUSEIPDB_API_KEY=${ABUSEIPDB_API_KEY}
+    volumes:
+      - shuffle-data:/shuffle-files
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - shuffle-db:/shuffle-database
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3001/api/v1/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  # ===========================================================================
+  # SHUFFLE SOAR FRONTEND
+  # ===========================================================================
+  shuffle-frontend:
+    image: ghcr.io/shuffle/shuffle-frontend:latest
+    container_name: shuffle-frontend
+    hostname: shuffle-frontend
+    restart: unless-stopped
+    depends_on:
+      shuffle-backend:
+        condition: service_healthy
+    networks:
+      - soc-network
+    ports:
+      - "3000:80"
+    environment:
+      - BACKEND_HOSTNAME=shuffle-backend
+      - BACKEND_PORT=3001
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:80/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
+
+  # ===========================================================================
+  # SHUFFLE ORBORUS (Workflow Executor)
+  # ===========================================================================
+  shuffle-orborus:
+    image: ghcr.io/shuffle/shuffle-orborus:latest
+    container_name: shuffle-orborus
+    hostname: shuffle-orborus
+    restart: unless-stopped
+    depends_on:
+      shuffle-backend:
+        condition: service_healthy
+    networks:
+      - soc-network
+    environment:
+      - SHUFFLE_APP_SDK_VERSION=1.1.0
+      - SHUFFLE_WORKER_VERSION=latest
+      - ORG_ID=${SHUFFLE_ORG_ID:-ThreatFlow}
+      - ENVIRONMENT_NAME=production
+      - BASE_URL=http://shuffle-backend:3001
+      - DOCKER_API_VERSION=1.40
+      - SHUFFLE_BASE_IMAGE_NAME=ghcr.io/shuffle/shuffle-worker
+      - SHUFFLE_BASE_IMAGE_REGISTRY=ghcr.io
+      - SHUFFLE_PASS_WORKER_PROXY=false
+      - SHUFFLE_PASS_APP_PROXY=false
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+      - NO_PROXY=${NO_PROXY:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
+
+  # ===========================================================================
+  # CASSANDRA (TheHive Database Backend)
+  # ===========================================================================
+  cassandra:
+    image: cassandra:4.1
+    container_name: cassandra
+    hostname: cassandra
+    restart: unless-stopped
+    networks:
+      - soc-network
+    environment:
+      - CASSANDRA_CLUSTER_NAME=${CASSANDRA_CLUSTER_NAME:-ThreatFlowCluster}
+      - CASSANDRA_DC=datacenter1
+      - CASSANDRA_ENDPOINT_SNITCH=GossipingPropertyFileSnitch
+      - HEAP_NEWSIZE=128M
+      - MAX_HEAP_SIZE=${CASSANDRA_HEAP_SIZE:-1G}
+    volumes:
+      - cassandra-data:/var/lib/cassandra
+    healthcheck:
+      test: ["CMD-SHELL", "nodetool status | grep -q UN"]
+      interval: 30s
+      timeout: 20s
+      retries: 10
+      start_period: 90s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 1G
+
+  # ===========================================================================
+  # ELASTICSEARCH (TheHive Indexing Engine)
+  # ===========================================================================
+  elasticsearch:
+    image: elasticsearch:8.11.0
+    container_name: elasticsearch
+    hostname: elasticsearch
+    restart: unless-stopped
+    networks:
+      - soc-network
+    ports:
+      - "9201:9200"
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=true
+      - "ELASTIC_PASSWORD=${ELASTICSEARCH_PASSWORD}"
+      - "ES_JAVA_OPTS=-Xms${ELASTICSEARCH_HEAP_MIN:-512m} -Xmx${ELASTICSEARCH_HEAP_MAX:-512m}"
+      - cluster.name=thehive-cluster
+      - bootstrap.memory_lock=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - elasticsearch-thehive-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sku elastic:${ELASTICSEARCH_PASSWORD} https://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 30s
+      timeout: 15s
+      retries: 10
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 512M
+
+  # ===========================================================================
+  # MINIO (Object Storage for TheHive Attachments)
+  # ===========================================================================
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    hostname: minio
+    restart: unless-stopped
+    networks:
+      - soc-network
+      - management-network
+    ports:
+      - "9002:9000"   # S3 API
+      - "9003:9001"   # MinIO Console
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/minio/health/live || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
+
+  # ===========================================================================
+  # THEHIVE (Case Management)
+  # ===========================================================================
+  thehive:
+    image: strangebee/thehive:5.3
+    container_name: thehive
+    hostname: thehive
+    restart: unless-stopped
+    depends_on:
+      cassandra:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - soc-network
+      - management-network
+    ports:
+      - "9000:9000"
+    environment:
+      - JVM_OPTS=-Xms${THEHIVE_HEAP_MIN:-512m} -Xmx${THEHIVE_HEAP_MAX:-1g}
+    volumes:
+      - thehive-data:/opt/thp/thehive/files
+      - ./config/thehive/application.conf:/etc/thehive/application.conf:ro
+    command:
+      - --secret
+      - "${THEHIVE_SECRET}"
+      - "--cql-hostnames"
+      - "cassandra"
+      - "--cql-username"
+      - "${CASSANDRA_USERNAME:-cassandra}"
+      - "--cql-password"
+      - "${CASSANDRA_PASSWORD:-cassandra}"
+      - "--index-backend"
+      - "elasticsearch"
+      - "--es-hostnames"
+      - "elasticsearch"
+      - "--es-index"
+      - "thehive"
+      - "--s3-endpoint"
+      - "http://minio:9000"
+      - "--s3-access-key"
+      - "${MINIO_ROOT_USER:-minioadmin}"
+      - "--s3-secret-key"
+      - "${MINIO_ROOT_PASSWORD}"
+      - "--s3-bucket"
+      - "thehive"
+      - "--s3-use-path-access-style"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/api/v1/status | grep -q 'TheHive'"]
+      interval: 30s
+      timeout: 15s
+      retries: 10
+      start_period: 120s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+
+  # ===========================================================================
+  # CORTEX (TheHive Analyzer/Responder Engine)
+  # ===========================================================================
+  cortex:
+    image: thehiveproject/cortex:3.1.8
+    container_name: cortex
+    hostname: cortex
+    restart: unless-stopped
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - soc-network
+      - management-network
+    ports:
+      - "9001:9001"
+    environment:
+      - JVM_OPTS=-Xms${CORTEX_HEAP_MIN:-256m} -Xmx${CORTEX_HEAP_MAX:-512m}
+      - job_directory=/tmp/cortex-jobs
+    volumes:
+      - cortex-data:/var/cortex
+      - ./config/cortex/application.conf:/etc/cortex/application.conf:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command:
+      - --secret
+      - "${CORTEX_SECRET}"
+      - "--es-uri"
+      - "http://elasticsearch:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9001/api/status | grep -q 'Cortex'"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M

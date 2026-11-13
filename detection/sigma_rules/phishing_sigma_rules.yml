@@ -1,0 +1,314 @@
+# =============================================================================
+# ThreatFlow SOAR — Phishing Detection Sigma Rules
+# Author:  ThreatFlow Detection Engineering
+# Version: 1.0.0
+# Updated: 2026-11-13
+#
+# Format:  Sigma (https://github.com/SigmaHQ/sigma)
+# Target:  Wazuh / Sysmon event logs
+# Backend: sigmac / pySigma wazuh / splunk / elastic backends
+#
+# Usage:
+#   sigmac -t wazuh -c sysmon phishing_sigma_rules.yml
+#   sigma convert -t splunk -p sysmon phishing_sigma_rules.yml
+# =============================================================================
+
+---
+# RULE 1 — Suspicious Office Child Process
+title: Suspicious Office Application Child Process
+id: 7b9d1f6c-3a4e-4b8f-9c2d-1e5f7a0b6d3e
+status: stable
+description: |
+  Detects Microsoft Office applications (Word, Excel, PowerPoint, Outlook) spawning
+  suspicious child processes commonly associated with macro-based phishing attacks.
+  Adversaries abuse Office VBA macros to execute scripting engines, command shells,
+  or Living-off-the-Land binaries (LOLBas) as the first stage of a phishing payload
+  delivery chain.
+author: ThreatFlow Detection Engineering
+date: 2026-11-13
+modified: 2026-11-13
+references:
+  - https://attack.mitre.org/techniques/T1566/001/
+  - https://attack.mitre.org/techniques/T1204/002/
+  - https://lolbas-project.github.io/
+logsource:
+  category: process_creation
+  product: windows
+detection:
+  selection_parent:
+    ParentImage|endswith:
+      - '\WINWORD.EXE'
+      - '\EXCEL.EXE'
+      - '\POWERPNT.EXE'
+      - '\OUTLOOK.EXE'
+      - '\ONENOTE.EXE'
+  selection_child:
+    Image|endswith:
+      - '\cmd.exe'
+      - '\powershell.exe'
+      - '\pwsh.exe'
+      - '\wscript.exe'
+      - '\cscript.exe'
+      - '\mshta.exe'
+      - '\regsvr32.exe'
+      - '\rundll32.exe'
+      - '\certutil.exe'
+      - '\bitsadmin.exe'
+      - '\msiexec.exe'
+      - '\InstallUtil.exe'
+  condition: selection_parent and selection_child
+falsepositives:
+  - Legitimate IT administration scripts triggered from scheduled Outlook macros
+  - Software installers launched from Office add-ins (rare but possible)
+  - Automated reporting macros in managed enterprise environments
+level: high
+tags:
+  - attack.initial_access
+  - attack.t1566.001
+  - attack.execution
+  - attack.t1204.002
+  - attack.t1059
+  - attack.defense_evasion
+  - attack.t1218
+
+---
+# RULE 2 — Email Attachment Execution via Script Host
+title: Email Attachment Execution via Windows Script Host
+id: 2c8e4f1a-7d5b-4c9e-8a3f-6b2d0e4c8f1a
+status: stable
+description: |
+  Detects Windows Script Host (wscript.exe / cscript.exe) or MSHTA executing scripts
+  with extensions commonly delivered as phishing email attachments (.js, .jse, .vbs,
+  .vbe, .wsf, .hta). This pattern indicates a user opened a malicious attachment which
+  then launched a scripting engine — a primary initial access vector in phishing campaigns.
+author: ThreatFlow Detection Engineering
+date: 2026-11-13
+modified: 2026-11-13
+references:
+  - https://attack.mitre.org/techniques/T1059/005/
+  - https://attack.mitre.org/techniques/T1059/007/
+  - https://attack.mitre.org/techniques/T1218/005/
+logsource:
+  category: process_creation
+  product: windows
+detection:
+  selection_image:
+    Image|endswith:
+      - '\wscript.exe'
+      - '\cscript.exe'
+      - '\mshta.exe'
+  selection_extension:
+    CommandLine|contains:
+      - '.js '
+      - '.jse '
+      - '.vbs '
+      - '.vbe '
+      - '.wsf '
+      - '.hta '
+      - '.js"'
+      - '.jse"'
+      - '.vbs"'
+      - '.hta"'
+  selection_userpath:
+    CommandLine|contains:
+      - '\AppData\'
+      - '\Temp\'
+      - '\Downloads\'
+      - '\Desktop\'
+  condition: selection_image and (selection_extension or selection_userpath)
+falsepositives:
+  - Legitimate enterprise logon scripts using VBScript
+  - Software deployment automation using WSH
+  - Internal IT tooling — verify by checking script content and origin path
+level: medium
+tags:
+  - attack.initial_access
+  - attack.t1566.001
+  - attack.execution
+  - attack.t1059.005
+  - attack.t1059.007
+  - attack.t1218.005
+
+---
+# RULE 3 — Credential Access via LSASS Memory
+title: Credential Access via LSASS Memory Access
+id: 5a3f8b2c-1e4d-4a7f-9c6b-8d2f0e3a5b1c
+status: stable
+description: |
+  Detects suspicious processes opening a handle to LSASS (Local Security Authority
+  Subsystem Service) with memory-read access rights. This is the primary technique
+  used by credential dumping tools such as Mimikatz, ProcDump, Cobalt Strike Beacon,
+  and comsvcs.dll MiniDump to extract plaintext credentials, NTLM hashes, and
+  Kerberos tickets from memory — a common post-exploitation step following phishing.
+author: ThreatFlow Detection Engineering
+date: 2026-11-13
+modified: 2026-11-13
+references:
+  - https://attack.mitre.org/techniques/T1003/001/
+  - https://github.com/gentilkiwi/mimikatz
+  - https://docs.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-openprocess
+logsource:
+  category: process_access
+  product: windows
+detection:
+  selection_target:
+    TargetImage|endswith: '\lsass.exe'
+  selection_access:
+    GrantedAccess|contains:
+      - '0x1010'
+      - '0x1410'
+      - '0x147a'
+      - '0x1fffff'
+      - '0x143a'
+  filter_legit:
+    SourceImage|endswith:
+      - '\MsMpEng.exe'
+      - '\csrss.exe'
+      - '\wininit.exe'
+      - '\services.exe'
+      - '\lsm.exe'
+      - '\svchost.exe'
+      - '\WerFault.exe'
+      - '\taskmgr.exe'
+  condition: selection_target and selection_access and not filter_legit
+falsepositives:
+  - Endpoint Detection and Response (EDR) agents reading LSASS for telemetry
+  - System monitoring tools with PROCESS_QUERY_INFORMATION rights
+  - Antivirus software performing memory scanning
+  - Add your EDR/AV process paths to the filter_legit block
+level: critical
+tags:
+  - attack.credential_access
+  - attack.t1003.001
+  - attack.t1078
+
+---
+# RULE 4 — Suspicious DNS Query Post-Email Activity
+title: Suspicious DNS Query from Email or Office Process
+id: 8f1b4e7c-6a2d-4c5f-a9e3-2b7d0f4a8c1e
+status: experimental
+description: |
+  Detects Office or email client processes issuing DNS queries to suspicious domains:
+  free TLDs associated with phishing infrastructure (.tk, .ml, .ga, .cf, .gq),
+  URL shorteners that mask malicious destinations, or paste/file-share sites used
+  for payload staging. When an email client resolves such a domain, it strongly
+  suggests the user has clicked a link in a phishing email.
+author: ThreatFlow Detection Engineering
+date: 2026-11-13
+modified: 2026-11-13
+references:
+  - https://attack.mitre.org/techniques/T1566/002/
+  - https://attack.mitre.org/techniques/T1071/004/
+  - https://attack.mitre.org/techniques/T1102/
+logsource:
+  category: dns_query
+  product: windows
+detection:
+  selection_process:
+    Image|endswith:
+      - '\OUTLOOK.EXE'
+      - '\THUNDERBIRD.EXE'
+      - '\WINWORD.EXE'
+      - '\EXCEL.EXE'
+      - '\POWERPNT.EXE'
+      - '\powershell.exe'
+      - '\wscript.exe'
+      - '\cscript.exe'
+      - '\mshta.exe'
+  selection_domains:
+    QueryName|endswith:
+      - '.tk'
+      - '.ml'
+      - '.ga'
+      - '.cf'
+      - '.gq'
+  selection_shorteners:
+    QueryName|contains:
+      - 'bit.ly'
+      - 'tinyurl.com'
+      - 'rb.gy'
+      - 'cutt.ly'
+      - 'is.gd'
+      - 'ow.ly'
+      - 'short.io'
+  selection_staging:
+    QueryName|contains:
+      - 'pastebin.com'
+      - 'hastebin.com'
+      - 'paste.ee'
+      - 'raw.githubusercontent.com'
+      - 'transfer.sh'
+      - 'filebin.net'
+      - 'gofile.io'
+      - 'temp.sh'
+  condition: selection_process and (selection_domains or selection_shorteners or selection_staging)
+falsepositives:
+  - Legitimate use of URL shorteners in business email newsletters
+  - GitHub Actions or automation that queries raw.githubusercontent.com
+  - Adjust by adding known-good domains to exclusion list per environment
+level: medium
+tags:
+  - attack.initial_access
+  - attack.t1566.002
+  - attack.command_and_control
+  - attack.t1071.004
+  - attack.t1102
+
+---
+# RULE 5 — ISO Mount and Execute Pattern
+title: ISO/IMG Disk Image Mount and Execution (Mark-of-the-Web Bypass)
+id: 3d6a2f9e-5b1c-4e8a-b7f4-9c3e1d5a0b2f
+status: stable
+description: |
+  Detects the ISO/IMG phishing delivery technique where adversaries deliver malicious
+  disk images via email (bypassing Mark-of-the-Web protections on Windows 10 pre-11H2).
+  When the user double-clicks the ISO, it auto-mounts as a drive letter. Executables
+  within the ISO lack a Zone.Identifier ADS and therefore execute without SmartScreen
+  warnings. This rule detects script engines or shells launching from a removable/optical
+  drive letter with Explorer or DllHost as the parent — the hallmark of ISO execution.
+author: ThreatFlow Detection Engineering
+date: 2026-11-13
+modified: 2026-11-13
+references:
+  - https://attack.mitre.org/techniques/T1553/005/
+  - https://attack.mitre.org/techniques/T1204/002/
+  - https://www.microsoft.com/security/blog/2022/06/16/using-process-creation-properties-to-catch-evasion-techniques/
+logsource:
+  category: process_creation
+  product: windows
+detection:
+  selection_parent:
+    ParentImage|endswith:
+      - '\explorer.exe'
+      - '\dllhost.exe'
+  selection_image:
+    Image|endswith:
+      - '\cmd.exe'
+      - '\powershell.exe'
+      - '\pwsh.exe'
+      - '\wscript.exe'
+      - '\mshta.exe'
+      - '\rundll32.exe'
+      - '\regsvr32.exe'
+  selection_drive:
+    # Processes running from non-C drive letters (mounted ISO appears as D:\, E:\, etc.)
+    CurrentDirectory|re: '^[D-Z]:\\'
+  filter_legit_drives:
+    # Exclude known legitimate secondary drives in your environment
+    CurrentDirectory|startswith:
+      - 'D:\Program Files'
+      - 'D:\ProgramData'
+  condition: selection_parent and selection_image and selection_drive and not filter_legit_drives
+falsepositives:
+  - Developers running scripts from USB drives or secondary local drives
+  - IT processes launched from network-mapped drives
+  - Legitimate software on D:\ or other fixed secondary disks
+  - Tune CurrentDirectory filter to match your storage layout
+level: high
+tags:
+  - attack.initial_access
+  - attack.t1566.001
+  - attack.execution
+  - attack.t1204.002
+  - attack.defense_evasion
+  - attack.t1553.005

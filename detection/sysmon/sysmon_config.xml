@@ -1,0 +1,360 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ThreatFlow SOAR - Production Sysmon 15 Configuration
+  Author:  ThreatFlow Detection Engineering
+  Version: 1.0.0
+  Updated: 2026-11-13
+
+  Purpose:
+    Capture high-fidelity endpoint telemetry for phishing detection while
+    minimising storage and noise from benign system activity.
+
+  Covered Event IDs:
+    1  – Process Creation
+    3  – Network Connection
+    5  – Process Terminated
+    7  – Image/DLL Load
+    8  – CreateRemoteThread
+    10 – ProcessAccess (OpenProcess)
+    11 – FileCreate
+    12 – Registry object added/deleted
+    13 – Registry value set
+    15 – FileCreateStreamHash (ADS)
+    17 – PipeEvent (pipe created)
+    22 – DNSEvent
+    23 – FileDelete
+
+  Hash Algorithms: SHA256 (primary), MD5 (secondary for legacy correlation)
+  Schema Version: 4.90 (Sysmon 15.x)
+
+  TUNING NOTES:
+    - Adjust <Exclude> entries to match your environment's legitimate software
+    - Test rule changes in a lab before production rollout
+    - Review Wazuh agent stats weekly to detect log volume spikes
+-->
+
+<Sysmon schemaversion="4.90">
+
+  <!-- Enable hashing for all file and image events -->
+  <HashAlgorithms>SHA256,MD5</HashAlgorithms>
+
+  <!-- Capture command line arguments in process create events -->
+  <CheckRevocation>False</CheckRevocation>
+
+  <EventFiltering>
+
+    <!-- ==========================================================
+         EVENT ID 1 — PROCESS CREATION
+         Captures: Image, CommandLine, ParentImage, ParentCommandLine,
+                   Hashes, User, LogonId, IntegrityLevel, CurrentDirectory
+         ==========================================================
+         PHILOSOPHY: Default-include with targeted exclusions.
+         Excluding high-volume, low-value system processes that are
+         well-understood and unlikely to be abused in phishing chains.
+         ========================================================== -->
+    <RuleGroup name="ProcessCreate" groupRelation="or">
+      <ProcessCreate onmatch="exclude">
+
+        <!-- Windows Update / servicing — extremely high volume, low risk -->
+        <Image condition="is">C:\Windows\System32\TiWorker.exe</Image>
+        <Image condition="is">C:\Windows\System32\wuauclt.exe</Image>
+        <Image condition="is">C:\Windows\SoftwareDistribution\Download\Install\WindowsUpdateBox.exe</Image>
+
+        <!-- Windows Defender — legitimate security tooling -->
+        <Image condition="is">C:\Program Files\Windows Defender\MpCmdRun.exe</Image>
+        <Image condition="begin with">C:\Program Files\Windows Defender Advanced Threat Protection\</Image>
+        <Image condition="is">C:\ProgramData\Microsoft\Windows Defender\Platform\</Image>
+
+        <!-- Sysmon itself -->
+        <Image condition="is">C:\Windows\Sysmon64.exe</Image>
+        <Image condition="is">C:\Windows\Sysmon.exe</Image>
+
+        <!-- System idle / registry workers -->
+        <Image condition="is">C:\Windows\System32\conhost.exe</Image>
+        <ParentImage condition="is">C:\Windows\System32\services.exe</ParentImage>
+        <Image condition="is">C:\Windows\System32\SearchIndexer.exe</Image>
+
+        <!-- Antivirus / EDR helpers (adjust for your AV) -->
+        <Image condition="begin with">C:\Program Files\CrowdStrike\</Image>
+        <Image condition="begin with">C:\Program Files\Carbon Black\</Image>
+        <Image condition="begin with">C:\Program Files (x86)\Symantec\</Image>
+        <Image condition="begin with">C:\Program Files (x86)\Trend Micro\</Image>
+
+        <!-- Visual Studio / developer tools (workstations only — remove for servers) -->
+        <Image condition="begin with">C:\Program Files\Microsoft Visual Studio\</Image>
+        <Image condition="begin with">C:\Program Files (x86)\Microsoft Visual Studio\</Image>
+
+        <!-- Chrome/Edge renderer subprocesses — routine, very high volume -->
+        <ParentImage condition="is">C:\Program Files\Google\Chrome\Application\chrome.exe</ParentImage>
+        <ParentImage condition="is">C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe</ParentImage>
+        <Image condition="end with">\nacl64.exe</Image>
+
+      </ProcessCreate>
+    </RuleGroup>
+
+    <!-- ==========================================================
+         EVENT ID 3 — NETWORK CONNECTION
+         Captures: Image, DestinationIp, DestinationPort, Protocol,
+                   SourceIp, SourcePort, Initiated, User
+         ==========================================================
+         PHILOSOPHY: Default-exclude (too noisy), include only
+         processes of interest for phishing detection.
+         ========================================================== -->
+    <RuleGroup name="NetworkConnect" groupRelation="or">
+      <NetworkConnect onmatch="include">
+
+        <!-- Email clients making external connections -->
+        <Image condition="is">C:\Program Files\Microsoft Office\root\Office16\OUTLOOK.EXE</Image>
+        <Image condition="is">C:\Program Files (x86)\Microsoft Office\root\Office16\OUTLOOK.EXE</Image>
+        <Image condition="end with">\THUNDERBIRD.EXE</Image>
+
+        <!-- Office applications making network connections (unusual) -->
+        <Image condition="end with">\WINWORD.EXE</Image>
+        <Image condition="end with">\EXCEL.EXE</Image>
+        <Image condition="end with">\POWERPNT.EXE</Image>
+        <Image condition="end with">\ONENOTE.EXE</Image>
+
+        <!-- Script engines and shells -->
+        <Image condition="is">C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe</Image>
+        <Image condition="is">C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe</Image>
+        <Image condition="end with">\pwsh.exe</Image>
+        <Image condition="is">C:\Windows\System32\cmd.exe</Image>
+        <Image condition="is">C:\Windows\System32\wscript.exe</Image>
+        <Image condition="is">C:\Windows\System32\cscript.exe</Image>
+        <Image condition="is">C:\Windows\System32\mshta.exe</Image>
+        <Image condition="is">C:\Windows\System32\regsvr32.exe</Image>
+        <Image condition="is">C:\Windows\System32\rundll32.exe</Image>
+        <Image condition="is">C:\Windows\System32\certutil.exe</Image>
+        <Image condition="is">C:\Windows\System32\bitsadmin.exe</Image>
+
+        <!-- LOLBAS network originators -->
+        <Image condition="is">C:\Windows\System32\msiexec.exe</Image>
+        <Image condition="is">C:\Windows\System32\InstallUtil.exe</Image>
+        <Image condition="is">C:\Windows\Microsoft.NET\Framework\v4.0.30319\MSBuild.exe</Image>
+        <Image condition="is">C:\Windows\Microsoft.NET\Framework64\v4.0.30319\MSBuild.exe</Image>
+
+        <!-- Any process connecting to high-risk ports — catch-all -->
+        <DestinationPort condition="is">4444</DestinationPort>
+        <DestinationPort condition="is">4445</DestinationPort>
+        <DestinationPort condition="is">1337</DestinationPort>
+        <DestinationPort condition="is">31337</DestinationPort>
+        <DestinationPort condition="is">9999</DestinationPort>
+        <DestinationPort condition="is">6666</DestinationPort>
+        <DestinationPort condition="is">1234</DestinationPort>
+
+      </NetworkConnect>
+    </RuleGroup>
+
+    <!-- ==========================================================
+         EVENT ID 5 — PROCESS TERMINATED
+         Minimal capture — useful for chain reconstruction.
+         Exclude very high-volume system terminators.
+         ========================================================== -->
+    <RuleGroup name="ProcessTerminate" groupRelation="or">
+      <ProcessTerminate onmatch="exclude">
+        <Image condition="is">C:\Windows\System32\SearchIndexer.exe</Image>
+        <Image condition="is">C:\Windows\System32\TiWorker.exe</Image>
+        <Image condition="is">C:\Windows\System32\wuauclt.exe</Image>
+      </ProcessTerminate>
+    </RuleGroup>
+
+    <!-- ==========================================================
+         EVENT ID 7 — IMAGE/DLL LOADED
+         Captures: Image (loading process), ImageLoaded, Signed,
+                   Signature, SignatureStatus, Hashes
+         ==========================================================
+         PHILOSOPHY: Include only Office/email processes loading DLLs,
+         looking specifically for unsigned or user-path DLLs.
+         ========================================================== -->
+    <RuleGroup name="ImageLoad" groupRelation="or">
+      <ImageLoad onmatch="include">
+
+        <!-- Office apps loading DLLs from non-standard locations -->
+        <Image condition="end with">\WINWORD.EXE</Image>
+        <Image condition="end with">\EXCEL.EXE</Image>
+        <Image condition="end with">\POWERPNT.EXE</Image>
+        <Image condition="end with">\OUTLOOK.EXE</Image>
+
+        <!-- Catch unsigned DLLs from user-writable paths regardless of loader -->
+        <ImageLoaded condition="contains">\AppData\</ImageLoaded>
+        <ImageLoaded condition="contains">\Temp\</ImageLoaded>
+        <ImageLoaded condition="contains">\Downloads\</ImageLoaded>
+        <ImageLoaded condition="contains">\Public\</ImageLoaded>
+
+        <!-- Known malicious/suspicious DLL names -->
+        <ImageLoaded condition="end with">\scrobj.dll</ImageLoaded>
+        <ImageLoaded condition="end with">\mscoree.dll</ImageLoaded>
+
+      </ImageLoad>
+    </RuleGroup>
+
+    <!-- ==========================================================
+         EVENT ID 8 — CREATEREMOTETHREAD
+         Captures: SourceImage, TargetImage, NewThreadId,
+                   StartAddress, StartModule, StartFunction
+         Process injection detection — capture all; volume is low.
+         ========================================================== -->
+    <RuleGroup name="CreateRemoteThread" groupRelation="or">
+      <CreateRemoteThread onmatch="exclude">
+        <!-- Legitimate cross-process thread creation by security tools -->
+        <SourceImage condition="is">C:\Windows\System32\csrss.exe</SourceImage>
+        <SourceImage condition="is">C:\Windows\System32\wininit.exe</SourceImage>
+        <TargetImage condition="is">C:\Windows\System32\lsass.exe</TargetImage>
+        <!-- Visual Studio debugger -->
+        <SourceImage condition="begin with">C:\Program Files\Microsoft Visual Studio\</SourceImage>
+      </CreateRemoteThread>
+    </RuleGroup>
+
+    <!-- ==========================================================
+         EVENT ID 10 — PROCESSACCESS (OpenProcess)
+         Captures: SourceImage, TargetImage, GrantedAccess, CallTrace
+         LSASS access is the primary target.
+         ========================================================== -->
+    <RuleGroup name="ProcessAccess" groupRelation="or">
+      <ProcessAccess onmatch="include">
+
+        <!-- Any access to LSASS is high-value -->
+        <TargetImage condition="is">C:\Windows\System32\lsass.exe</TargetImage>
+
+        <!-- Access to other sensitive processes -->
+        <TargetImage condition="is">C:\Windows\System32\svchost.exe</TargetImage>
+        <TargetImage condition="end with">\WINWORD.EXE</TargetImage>
+        <TargetImage condition="end with">\OUTLOOK.EXE</TargetImage>
+
+      </ProcessAccess>
+    </RuleGroup>
+
+    <!-- ==========================================================
+         EVENT ID 11 — FILE CREATE
+         Captures: Image (creating process), TargetFilename, CreationUtcTime
+         Focus: suspicious extensions dropped by email/Office processes.
+         ========================================================== -->
+    <RuleGroup name="FileCreate" groupRelation="or">
+      <FileCreate onmatch="include">
+
+        <!-- Script and executable files dropped by any process in user paths -->
+        <TargetFilename condition="end with">.hta</TargetFilename>
+        <TargetFilename condition="end with">.js</TargetFilename>
+        <TargetFilename condition="end with">.jse</TargetFilename>
+        <TargetFilename condition="end with">.vbs</TargetFilename>
+        <TargetFilename condition="end with">.vbe</TargetFilename>
+        <TargetFilename condition="end with">.wsf</TargetFilename>
+        <TargetFilename condition="end with">.wsh</TargetFilename>
+        <TargetFilename condition="end with">.ps1</TargetFilename>
+        <TargetFilename condition="end with">.psm1</TargetFilename>
+        <TargetFilename condition="end with">.bat</TargetFilename>
+        <TargetFilename condition="end with">.cmd</TargetFilename>
+        <TargetFilename condition="end with">.iso</TargetFilename>
+        <TargetFilename condition="end with">.img</TargetFilename>
+        <TargetFilename condition="end with">.vhd</TargetFilename>
+        <TargetFilename condition="end with">.vhdx</TargetFilename>
+        <TargetFilename condition="end with">.lnk</TargetFilename>
+
+        <!-- Executables and DLLs in user-writable directories -->
+        <TargetFilename condition="contains">\AppData\Local\Temp\</TargetFilename>
+        <TargetFilename condition="contains">\AppData\Roaming\</TargetFilename>
+        <TargetFilename condition="contains">\Downloads\</TargetFilename>
+        <TargetFilename condition="contains">\Public\</TargetFilename>
+
+        <!-- Startup folder (persistence) -->
+        <TargetFilename condition="contains">\Microsoft\Windows\Start Menu\Programs\Startup\</TargetFilename>
+
+      </FileCreate>
+    </RuleGroup>
+
+    <!-- ==========================================================
+         EVENT ID 12/13 — REGISTRY EVENTS
+         Captures: EventType, Image, TargetObject, Details
+         Focus: Run keys and autostart persistence locations.
+         ========================================================== -->
+    <RuleGroup name="RegistryEvent" groupRelation="or">
+      <RegistryEvent onmatch="include">
+
+        <!-- Classic autostart/persistence keys -->
+        <TargetObject condition="contains">SOFTWARE\Microsoft\Windows\CurrentVersion\Run</TargetObject>
+        <TargetObject condition="contains">SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce</TargetObject>
+        <TargetObject condition="contains">SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon</TargetObject>
+        <TargetObject condition="contains">SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options</TargetObject>
+        <TargetObject condition="contains">SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run</TargetObject>
+        <TargetObject condition="contains">SYSTEM\CurrentControlSet\Services</TargetObject>
+
+        <!-- Office macro trust settings tampering -->
+        <TargetObject condition="contains">SOFTWARE\Microsoft\Office\</TargetObject>
+        <TargetObject condition="contains">Security\AccessVBOM</TargetObject>
+        <TargetObject condition="contains">Security\VBAWarnings</TargetObject>
+
+      </RegistryEvent>
+    </RuleGroup>
+
+    <!-- ==========================================================
+         EVENT ID 15 — FILECREATE STREAM HASH (Alternate Data Streams)
+         Captures: Image, TargetFilename, Hash (of ADS contents)
+         Mark-of-the-Web (Zone.Identifier) bypass detection.
+         ========================================================== -->
+    <RuleGroup name="FileCreateStreamHash" groupRelation="or">
+      <FileCreateStreamHash onmatch="include">
+        <!-- Files downloaded from internet — always capture -->
+        <TargetFilename condition="end with">.exe</TargetFilename>
+        <TargetFilename condition="end with">.dll</TargetFilename>
+        <TargetFilename condition="end with">.iso</TargetFilename>
+        <TargetFilename condition="end with">.zip</TargetFilename>
+        <TargetFilename condition="end with">.docm</TargetFilename>
+        <TargetFilename condition="end with">.xlsm</TargetFilename>
+        <TargetFilename condition="end with">.xlam</TargetFilename>
+        <TargetFilename condition="end with">.dotm</TargetFilename>
+      </FileCreateStreamHash>
+    </RuleGroup>
+
+    <!-- ==========================================================
+         EVENT ID 22 — DNS QUERY
+         Captures: Image, QueryName, QueryStatus, QueryResults
+         ========================================================== -->
+    <RuleGroup name="DnsQuery" groupRelation="or">
+      <DnsQuery onmatch="exclude">
+
+        <!-- Windows built-in DNS operations — routine, high volume -->
+        <Image condition="is">C:\Windows\System32\svchost.exe</Image>
+        <Image condition="is">C:\Windows\System32\SearchIndexer.exe</Image>
+        <Image condition="is">C:\Windows\System32\spoolsv.exe</Image>
+        <Image condition="is">C:\Windows\System32\WerFault.exe</Image>
+        <Image condition="is">C:\Windows\System32\backgroundTaskHost.exe</Image>
+
+        <!-- Known-good update endpoints -->
+        <QueryName condition="end with">.windowsupdate.com</QueryName>
+        <QueryName condition="end with">.windows.com</QueryName>
+        <QueryName condition="end with">.microsoft.com</QueryName>
+        <QueryName condition="end with">.office.com</QueryName>
+        <QueryName condition="end with">.office365.com</QueryName>
+        <QueryName condition="end with">.live.com</QueryName>
+        <QueryName condition="end with">.msftconnecttest.com</QueryName>
+        <QueryName condition="end with">.msftncsi.com</QueryName>
+
+        <!-- Browser routine DNS (browsers have high DNS volume) -->
+        <Image condition="end with">\chrome.exe</Image>
+        <Image condition="end with">\firefox.exe</Image>
+        <Image condition="end with">\msedge.exe</Image>
+
+      </DnsQuery>
+    </RuleGroup>
+
+    <!-- ==========================================================
+         EVENT ID 23 — FILE DELETE
+         Captures: Image, TargetFilename, Hashes, IsExecutable
+         Evidence wiping — catch deletion of dropped payloads.
+         ========================================================== -->
+    <RuleGroup name="FileDelete" groupRelation="or">
+      <FileDelete onmatch="include">
+
+        <!-- Deletion of executables from user-writable paths — cleanup -->
+        <TargetFilename condition="contains">\AppData\Local\Temp\</TargetFilename>
+        <TargetFilename condition="end with">.exe</TargetFilename>
+        <TargetFilename condition="end with">.dll</TargetFilename>
+        <TargetFilename condition="end with">.ps1</TargetFilename>
+        <TargetFilename condition="end with">.vbs</TargetFilename>
+
+      </FileDelete>
+    </RuleGroup>
+
+  </EventFiltering>
+
+</Sysmon>
